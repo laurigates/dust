@@ -1,5 +1,5 @@
 use crate::dir_walker::WalkData;
-use crate::platform::{MetadataTuple, get_metadata};
+use crate::platform::{MetadataTuple, SharedBlocks, get_metadata};
 use crate::utils::is_filtered_out_due_to_file_time;
 use crate::utils::is_filtered_out_due_to_invert_regex;
 use crate::utils::is_filtered_out_due_to_regex;
@@ -14,6 +14,8 @@ pub struct Node {
     pub children: Vec<Node>,
     pub inode_device: Option<(u64, u64)>,
     pub depth: usize,
+    /// Only read under `--shared-blocks`.
+    pub shared: SharedBlocks,
 }
 
 #[derive(Debug, PartialEq)]
@@ -106,6 +108,7 @@ fn node_from_tuple(
         children,
         inode_device,
         depth,
+        shared: Default::default(),
     }
 }
 

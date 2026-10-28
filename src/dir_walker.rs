@@ -22,12 +22,13 @@ use std::path::PathBuf;
 use std::collections::HashSet;
 
 use rustc_hash::FxHashSet;
+use std::num::NonZeroU64;
 
 use crate::node::build_node;
 use std::fs::DirEntry;
 
 use crate::node::FileTime;
-use crate::platform::{MetadataTuple, get_metadata, tuple_from_metadata};
+use crate::platform::{MetadataTuple, get_metadata, get_shared_blocks, tuple_from_metadata};
 
 #[derive(Debug)]
 pub enum Operator {
@@ -57,7 +58,14 @@ pub struct WalkData<'a> {
     // path in `process_entry` can skip the function call entirely when no
     // filter flags are set.
     pub has_any_filter: bool,
+    // `--shared-blocks`: record each file's `SharedBlocks` so `clean_inodes`
+    // can count blocks shared between files (clones) only once. main.rs
+    // clears it for modes where it means nothing (apparent size, counts, times).
+    pub shared_blocks: bool,
 }
+
+// Shared blocks already counted: (device, clone id) pairs.
+type CountedShared = FxHashSet<(u64, NonZeroU64)>;
 
 // Per-directory bookkeeping used during the parallel walk. Each directory gets
 // one `PendingDir`. Subdirectory tasks hold an `Arc` back to their parent so
@@ -88,6 +96,7 @@ pub fn walk_it(dirs: HashSet<PathBuf>, walk_data: &WalkData) -> Vec<Node> {
     // primitive keys. DoS resistance is irrelevant here; the keys are
     // (inode, device) pairs from the filesystem, not user input.
     let mut inodes: FxHashSet<(u64, u64)> = FxHashSet::default();
+    let mut counted = CountedShared::default();
     let mut top_level_nodes: Vec<Node> = Vec::new();
 
     for d in dirs {
@@ -140,7 +149,7 @@ pub fn walk_it(dirs: HashSet<PathBuf>, walk_data: &WalkData) -> Vec<Node> {
 
         let mut outer_children = std::mem::take(&mut *outer.children.lock().unwrap());
         if let Some(node) = outer_children.pop()
-            && let Some(cleaned) = clean_inodes(node, &mut inodes, walk_data)
+            && let Some(cleaned) = clean_inodes(node, &mut inodes, &mut counted, walk_data)
         {
             top_level_nodes.push(cleaned);
         }
@@ -149,7 +158,14 @@ pub fn walk_it(dirs: HashSet<PathBuf>, walk_data: &WalkData) -> Vec<Node> {
 }
 
 // Remove files which have the same inode, we don't want to double count them.
-fn clean_inodes(x: Node, inodes: &mut FxHashSet<(u64, u64)>, walk_data: &WalkData) -> Option<Node> {
+// Likewise, under `--shared-blocks`, subtract the blocks a file shares with a
+// file already counted (clones); the first file visited owns them.
+fn clean_inodes(
+    x: Node,
+    inodes: &mut FxHashSet<(u64, u64)>,
+    counted: &mut CountedShared,
+    walk_data: &WalkData,
+) -> Option<Node> {
     if !walk_data.use_apparent_size
         && let Some(id) = x.inode_device
         && !inodes.insert(id)
@@ -157,12 +173,17 @@ fn clean_inodes(x: Node, inodes: &mut FxHashSet<(u64, u64)>, walk_data: &WalkDat
         return None;
     }
 
+    let own_size = match x.inode_device {
+        Some((_, dev)) => x.size.saturating_sub(already_counted(&x, dev, counted)),
+        None => x.size,
+    };
+
     // Sort Nodes so iteration order is predictable
     let mut tmp: Vec<_> = x.children;
     tmp.sort_by(sort_by_inode);
     let new_children: Vec<_> = tmp
         .into_iter()
-        .filter_map(|c| clean_inodes(c, inodes, walk_data))
+        .filter_map(|c| clean_inodes(c, inodes, counted, walk_data))
         .collect();
 
     let actual_size = if walk_data.by_filetime.is_some() {
@@ -175,7 +196,7 @@ fn clean_inodes(x: Node, inodes: &mut FxHashSet<(u64, u64)>, walk_data: &WalkDat
             .unwrap_or(0)
     } else {
         // If by_filetime is None, directory 'size' is the sum of disk sizes or file counts of child files
-        x.size + new_children.iter().map(|c| c.size).sum::<u64>()
+        own_size + new_children.iter().map(|c| c.size).sum::<u64>()
     };
 
     Some(Node {
@@ -184,7 +205,18 @@ fn clean_inodes(x: Node, inodes: &mut FxHashSet<(u64, u64)>, walk_data: &WalkDat
         children: new_children,
         inode_device: x.inode_device,
         depth: x.depth,
+        // Already counted above; nothing downstream reads them.
+        shared: Default::default(),
     })
+}
+
+// How many bytes of `x` another file has already been charged for.
+// A full clone of a file already counted shares all of its blocks.
+fn already_counted(x: &Node, dev: u64, counted: &mut CountedShared) -> u64 {
+    match x.shared {
+        Some(clone_id) if !counted.insert((dev, clone_id)) => x.size,
+        _ => 0,
+    }
 }
 
 fn sort_by_inode(a: &Node, b: &Node) -> std::cmp::Ordering {
@@ -523,7 +555,7 @@ fn process_entry<'scope>(
         prefetched = Some((0, Some((entry.ino(), parent_dev)), (0, 0, 0)));
     }
 
-    let node = build_node(
+    let mut node = build_node(
         entry.path(),
         vec![],
         prefetched,
@@ -532,6 +564,16 @@ fn process_entry<'scope>(
         pending.depth,
         walk_data,
     );
+
+    // Skip files a filter zeroed out: their blocks must stay unclaimed so a
+    // clone that is shown gets charged for them.
+    if walk_data.shared_blocks
+        && data.is_file()
+        && let Some(n) = node.as_mut()
+        && n.size > 0
+    {
+        n.shared = get_shared_blocks(&path);
+    }
 
     let prog_data = &walk_data.progress_data;
     prog_data.num_files.fetch_add(1, ORDERING);
@@ -644,6 +686,7 @@ mod tests {
             children: vec![],
             inode_device: Some((5, 6)),
             depth: 0,
+            shared: Default::default(),
         }
     }
 
@@ -667,6 +710,7 @@ mod tests {
             progress_data: indicator.data.clone(),
             errors: Arc::new(Mutex::new(RuntimeErrors::default())),
             has_any_filter: true,
+            shared_blocks: false,
         }
     }
 
@@ -674,35 +718,78 @@ mod tests {
     #[allow(clippy::redundant_clone)]
     fn test_should_ignore_file() {
         let mut inodes = FxHashSet::default();
+        let mut counted = CountedShared::default();
         let n = create_node();
         let walkdata = create_walker(false);
 
         // First time we insert the node
         assert_eq!(
-            clean_inodes(n.clone(), &mut inodes, &walkdata),
+            clean_inodes(n.clone(), &mut inodes, &mut counted, &walkdata),
             Some(n.clone())
         );
 
         // Second time is a duplicate - we ignore it
-        assert_eq!(clean_inodes(n.clone(), &mut inodes, &walkdata), None);
+        assert_eq!(
+            clean_inodes(n.clone(), &mut inodes, &mut counted, &walkdata),
+            None
+        );
     }
 
     #[test]
     #[allow(clippy::redundant_clone)]
     fn test_should_not_ignore_files_if_using_apparent_size() {
         let mut inodes = FxHashSet::default();
+        let mut counted = CountedShared::default();
         let n = create_node();
         let walkdata = create_walker(true);
 
         // If using apparent size we include Nodes, even if duplicate inodes
         assert_eq!(
-            clean_inodes(n.clone(), &mut inodes, &walkdata),
+            clean_inodes(n.clone(), &mut inodes, &mut counted, &walkdata),
             Some(n.clone())
         );
         assert_eq!(
-            clean_inodes(n.clone(), &mut inodes, &walkdata),
+            clean_inodes(n.clone(), &mut inodes, &mut counted, &walkdata),
             Some(n.clone())
         );
+    }
+
+    #[test]
+    fn test_full_clones_counted_once() {
+        let file = |name: &str, ino, clone_id| Node {
+            name: PathBuf::from(name),
+            size: 4096,
+            children: vec![],
+            inode_device: Some((ino, 1)),
+            depth: 1,
+            shared: NonZeroU64::new(clone_id),
+        };
+        let dir = Node {
+            name: PathBuf::from("dir"),
+            size: 0,
+            children: vec![
+                file("original", 1, 1),
+                file("clone", 2, 1),
+                // Not a full clone of anything: no clone id recorded.
+                file("other", 3, 0),
+            ],
+            inode_device: Some((10, 1)),
+            depth: 0,
+            shared: Default::default(),
+        };
+
+        let walkdata = create_walker(false);
+        let cleaned = clean_inodes(
+            dir,
+            &mut FxHashSet::default(),
+            &mut CountedShared::default(),
+            &walkdata,
+        )
+        .unwrap();
+
+        let sizes: Vec<u64> = cleaned.children.iter().map(|c| c.size).collect();
+        assert_eq!(sizes, vec![4096, 0, 4096]);
+        assert_eq!(cleaned.size, 4096 * 2);
     }
 
     #[test]
@@ -715,6 +802,7 @@ mod tests {
             children: vec![],
             inode_device: Some((3, 66310)),
             depth: 0,
+            shared: Default::default(),
         };
 
         let b = Node {
@@ -723,6 +811,7 @@ mod tests {
             children: vec![],
             inode_device: None,
             depth: 0,
+            shared: Default::default(),
         };
 
         let c = Node {
@@ -731,6 +820,7 @@ mod tests {
             children: vec![],
             inode_device: Some((1, 66310)),
             depth: 0,
+            shared: Default::default(),
         };
 
         assert_eq!(sort_by_inode(&a, &b), Ordering::Greater);
