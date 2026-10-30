@@ -282,7 +282,7 @@ fn main() {
         progress_data: indicator.data.clone(),
         errors: errors_for_rayon,
         has_any_filter,
-        shared_blocks,
+        shared_blocks: shared_blocks.then(Default::default),
     };
 
     let threads_to_use = config.get_threads(&options);
