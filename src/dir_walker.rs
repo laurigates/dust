@@ -14,7 +14,7 @@ use crate::progress::RuntimeErrors;
 use crate::utils::is_filtered_out_due_to_file_time;
 use crate::utils::is_filtered_out_due_to_invert_regex;
 use crate::utils::is_filtered_out_due_to_regex;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use regex::Regex;
 use std::path::Path;
 use std::path::PathBuf;
@@ -427,7 +427,7 @@ fn walk_dir<'scope>(
         // EINTR is the only retryable error. Looping iteratively (rather than
         // recursing on retry, like the old code) keeps stack depth O(1).
         loop {
-            let entries = match fs::read_dir(&pending.dir) {
+            let mut entries = match fs::read_dir(&pending.dir) {
                 Ok(entries) => entries,
                 Err(ref failed) => {
                     record_error(failed, &pending.dir, walk_data);
@@ -442,7 +442,10 @@ fn walk_dir<'scope>(
             // This is the load-bearing structural choice for retry safety: if
             // we decide to retry, we throw the Vec away and re-list, with no
             // spawned subdir tasks or pushed file nodes to roll back.
-            let collected: Vec<_> = entries.collect();
+            //
+            // `by_ref` keeps `entries` (the ReadDir) alive until the end of
+            // this iteration; see the closedir note below.
+            let collected: Vec<_> = entries.by_ref().collect();
 
             // If any entry yielded a retryable error, throw the Vec away and
             // re-list. We record only that one error (which bumps the EINTR
@@ -475,28 +478,36 @@ fn walk_dir<'scope>(
                 children.reserve(collected.len());
             }
 
-            // Keep every DirEntry on this thread. Each one holds the
-            // directory stream, so the last one dropped calls closedir() on
-            // the directory's fd, and DirEntry::file_type() falls back to a
-            // statx relative to that fd when d_type is DT_UNKNOWN. With
+            // The directory's fd must only be used on this thread. With
             // --shared-blocks on Linux each worker thread has its own fd
             // table (see init_rayon), where that fd number is absent or
-            // names another file. So resolve the types here, hand the
-            // workers borrowed entries, and let `collected` drop on this
-            // thread after the collect below returns.
+            // names another file. Two DirEntry paths touch it:
+            //   * file_type() falls back to a statx relative to the
+            //     directory fd when d_type is DT_UNKNOWN, so the types are
+            //     resolved here, before the entries reach the workers.
+            //   * every DirEntry holds the directory stream, and the last
+            //     holder to drop calls closedir(). `entries` holds it too
+            //     and outlives the collect below (by_ref above), so the
+            //     workers drop entries without ever being the last holder,
+            //     and closedir() runs here when `entries` goes out of scope.
             let typed: Vec<_> = collected
-                .iter()
-                .map(|r| r.as_ref().map(|entry| (entry, entry.file_type())))
+                .into_iter()
+                .map(|r| {
+                    r.map(|entry| {
+                        let file_type = entry.file_type();
+                        (entry, file_type)
+                    })
+                })
                 .collect();
             let file_nodes: Vec<Node> = typed
-                .par_iter()
+                .into_par_iter()
                 .filter_map(|r| match r {
                     Ok((entry, Ok(file_type))) => {
-                        process_entry(scope, &pending, entry, *file_type, walk_data)
+                        process_entry(scope, &pending, &entry, file_type, walk_data)
                     }
                     Ok((_, Err(_))) => None,
                     Err(failed) => {
-                        record_error(failed, &pending.dir, walk_data);
+                        record_error(&failed, &pending.dir, walk_data);
                         None
                     }
                 })
