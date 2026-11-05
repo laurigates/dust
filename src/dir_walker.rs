@@ -14,7 +14,7 @@ use crate::progress::RuntimeErrors;
 use crate::utils::is_filtered_out_due_to_file_time;
 use crate::utils::is_filtered_out_due_to_invert_regex;
 use crate::utils::is_filtered_out_due_to_regex;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use regex::Regex;
 use std::path::Path;
 use std::path::PathBuf;
@@ -475,12 +475,28 @@ fn walk_dir<'scope>(
                 children.reserve(collected.len());
             }
 
-            let file_nodes: Vec<Node> = collected
-                .into_par_iter()
+            // Keep every DirEntry on this thread. Each one holds the
+            // directory stream, so the last one dropped calls closedir() on
+            // the directory's fd, and DirEntry::file_type() falls back to a
+            // statx relative to that fd when d_type is DT_UNKNOWN. With
+            // --shared-blocks on Linux each worker thread has its own fd
+            // table (see init_rayon), where that fd number is absent or
+            // names another file. So resolve the types here, hand the
+            // workers borrowed entries, and let `collected` drop on this
+            // thread after the collect below returns.
+            let typed: Vec<_> = collected
+                .iter()
+                .map(|r| r.as_ref().map(|entry| (entry, entry.file_type())))
+                .collect();
+            let file_nodes: Vec<Node> = typed
+                .par_iter()
                 .filter_map(|r| match r {
-                    Ok(entry) => process_entry(scope, &pending, &entry, walk_data),
+                    Ok((entry, Ok(file_type))) => {
+                        process_entry(scope, &pending, entry, *file_type, walk_data)
+                    }
+                    Ok((_, Err(_))) => None,
                     Err(failed) => {
-                        record_error(&failed, &pending.dir, walk_data);
+                        record_error(failed, &pending.dir, walk_data);
                         None
                     }
                 })
@@ -508,14 +524,13 @@ fn process_entry<'scope>(
     scope: &rayon::Scope<'scope>,
     pending: &Arc<PendingDir>,
     entry: &DirEntry,
+    file_type: std::fs::FileType,
     walk_data: &'scope WalkData<'scope>,
 ) -> Option<Node> {
-    // Compute path + file_type once per entry and thread them through.
-    // `entry.path()` allocates a PathBuf; `entry.file_type()` can require a
-    // stat on filesystems without d_type support. Previously each was called
-    // up to 3 times per entry.
+    // Compute path once per entry and thread it through; `entry.path()`
+    // allocates a PathBuf. `file_type` was resolved by the caller on the
+    // thread that read the directory (see walk_dir).
     let path = entry.path();
-    let file_type = entry.file_type().ok()?;
     // Fetch metadata at most once per entry. Without filters, the
     // per-file stat lives inside `build_node` as before. With filters,
     // we used to stat twice — once in `ignore_file` for the filter
@@ -542,7 +557,7 @@ fn process_entry<'scope>(
     } else if walk_data.ignore_hidden && entry.file_name().to_str().unwrap_or("").starts_with('.') {
         return None;
     }
-    let data = entry.file_type().ok()?;
+    let data = file_type;
     let is_symlink = data.is_symlink();
 
     // If the entry is a directory we'll spawn off a new task to walk it.
