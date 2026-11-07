@@ -336,11 +336,42 @@ pub fn get_shared_blocks(path: &Path, dev: u64) -> SharedBlocks {
         cache.lock().unwrap().insert(dev, can_share);
         can_share
     });
-    if can_share {
+    if can_share && may_share(path) {
         get_extents(path)
     } else {
         Box::default()
     }
+}
+
+/// False only when the kernel says the file has no shared extents: it
+/// reports STATX_ATTR_MAY_SHARE in stx_attributes_mask with the bit clear.
+/// The bit is a prototype (laurigates/xfs-fiemap-contention#23), not in any
+/// released kernel, so everywhere else this returns true and FIEMAP runs.
+/// The extra statx() costs a path lookup; a real integration would read the
+/// bit from the walker's own statx call.
+#[cfg(target_os = "linux")]
+fn may_share(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    const STATX_ATTR_MAY_SHARE: u64 = 0x0080_0000;
+
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            cpath.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+            0,
+            &raw mut stx,
+        )
+    } != 0
+    {
+        return true;
+    }
+    stx.stx_attributes_mask & STATX_ATTR_MAY_SHARE == 0
+        || stx.stx_attributes & STATX_ATTR_MAY_SHARE != 0
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
